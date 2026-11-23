@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/Code-Hex/vz/v3"
@@ -45,6 +47,9 @@ type VirtualMachineParams struct {
 	PostStartAction  *resource.ExecAction
 	IgnoreImageCache bool
 	RegistryCreds    resource.RegistryCredentials
+	// SlotDiskDir, when set, is a host folder holding one disk image per VM slot,
+	// slot-<n>.img. The VM's image is attached read-write as a second disk.
+	SlotDiskDir string
 }
 
 // MacOSClient manages the lifecycle of macOS virtual machines.
@@ -54,7 +59,7 @@ type MacOSClient struct {
 
 	eventRecorder              event.EventRecorder
 	networkInterfaceIdentifier string
-	vmPermits                  chan struct{}
+	vmSlots                    *slotPool
 }
 
 // NewMacOSClient initializes a new MacOSClient instance.
@@ -70,7 +75,7 @@ func NewMacOSClient(ctx context.Context, eventRecorder event.EventRecorder, netw
 		eventRecorder:              eventRecorder,
 		networkInterfaceIdentifier: networkInterfaceIdentifier,
 		downloadManager:            downloader.NewManager(eventRecorder, cachePath),
-		vmPermits:                  make(chan struct{}, MaxVirtualMachines),
+		vmSlots:                    newSlotPool(MaxVirtualMachines),
 		vms:                        vmdata.NewVirtualMachineData(),
 	}
 }
@@ -139,8 +144,8 @@ func (c *MacOSClient) handleVirtualMachineCreation(ctx context.Context, params V
 	c.eventRecorder.PulledImage(ctx, params.Image, params.ContainerName, duration.String())
 	logger.Debug(cfg)
 
-	// Wait until resources are available to proceed with the virtual machine creation
-	guard, acquireErr := c.acquirePermit(ctx, types.NamespacedName{Namespace: params.Namespace, Name: params.Name})
+	// Wait until a VM slot is free to proceed with the virtual machine creation
+	slot, guard, acquireErr := c.acquireSlot(ctx, types.NamespacedName{Namespace: params.Namespace, Name: params.Name})
 	if acquireErr != nil {
 		err = acquireErr
 		return
@@ -148,7 +153,7 @@ func (c *MacOSClient) handleVirtualMachineCreation(ctx context.Context, params V
 	defer guard.Release(ctx)
 
 	// Create the virtual machine instance
-	vm, err := c.createVirtualMachineInstance(ctx, cfg, params)
+	vm, err := c.createVirtualMachineInstance(ctx, cfg, params, slot)
 	if err != nil {
 		return
 	}
@@ -219,8 +224,8 @@ func (c *MacOSClient) finalizeVirtualMachineInfo(ctx context.Context, params Vir
 }
 
 // createVirtualMachineInstance creates a new virtual machine instance with the specified parameters.
-func (c *MacOSClient) createVirtualMachineInstance(ctx context.Context, cfg config.MacPlatformConfigurationOptions, params VirtualMachineParams) (*vm.VirtualMachineInstance, error) {
-	vm, err := setupVM(ctx, cfg, params.UID, params.CPU, params.MemorySize, c.networkInterfaceIdentifier, params.Mounts)
+func (c *MacOSClient) createVirtualMachineInstance(ctx context.Context, cfg config.MacPlatformConfigurationOptions, params VirtualMachineParams, slot int) (*vm.VirtualMachineInstance, error) {
+	vm, err := setupVM(ctx, cfg, params.UID, params.CPU, params.MemorySize, c.networkInterfaceIdentifier, params.Mounts, slotDiskPath(ctx, params.SlotDiskDir, slot))
 	if err != nil {
 		c.eventRecorder.FailedToCreateContainer(ctx, params.ContainerName, err)
 		return nil, err
@@ -254,10 +259,12 @@ func (c *MacOSClient) DeleteVirtualMachine(ctx context.Context, namespace string
 		return nil
 	}
 
-	// Delete must execute before releasePermit (defers are LIFO).
-	// releasePermit handles the missing-entry case via non-blocking channel drain.
-	defer c.vms.Delete(namespace, name)
-	defer c.releasePermit(ctx, types.NamespacedName{Namespace: namespace, Name: name})
+	// Delete the info before releasing the slot, so a creation still waiting for a
+	// slot finds the info gone and gives the slot straight back.
+	defer func() {
+		c.vms.Delete(namespace, name)
+		c.releaseSlot(ctx, types.NamespacedName{Namespace: namespace, Name: name})
+	}()
 
 	if info.DownloadCancelFunc != nil {
 		info.DownloadCancelFunc()
@@ -387,12 +394,13 @@ func (c *MacOSClient) getVirtualMachineInfo(ctx context.Context, namespace, name
 }
 
 // setupVM creates a new virtual machine instance with the given parameters.
-func setupVM(ctx context.Context, cfg config.MacPlatformConfigurationOptions, uid string, cpu uint, memorySize uint64, networkInterfaceIdentifier string, mounts []volumes.Mount) (*vm.VirtualMachineInstance, error) {
-	log.G(ctx).Debugf("Creating virtual machine with CPU: %d, memory: %d, network interface: %s, mounts: %+v", cpu, memorySize, networkInterfaceIdentifier, mounts)
+func setupVM(ctx context.Context, cfg config.MacPlatformConfigurationOptions, uid string, cpu uint, memorySize uint64, networkInterfaceIdentifier string, mounts []volumes.Mount, slotDiskPath string) (*vm.VirtualMachineInstance, error) {
+	log.G(ctx).Debugf("Creating virtual machine with CPU: %d, memory: %d, network interface: %s, mounts: %+v, slot disk: %q", cpu, memorySize, networkInterfaceIdentifier, mounts, slotDiskPath)
 	platformConfig, err := config.NewPlatformConfiguration(ctx, cfg, true, uid)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create platform configuration: %w", err)
 	}
+	platformConfig.SlotDiskPath = slotDiskPath
 
 	vmConfig, err := config.NewVirtualMachineConfiguration(ctx, platformConfig, cpu, memorySize, networkInterfaceIdentifier, mounts)
 	if err != nil {
@@ -405,4 +413,18 @@ func setupVM(ctx context.Context, cfg config.MacPlatformConfigurationOptions, ui
 	}
 
 	return vmInstance, nil
+}
+
+// slotDiskPath returns the slot's disk image in dir, or "" when dir is unset or the
+// image does not exist. A missing image is logged and the VM starts without it.
+func slotDiskPath(ctx context.Context, dir string, slot int) string {
+	if dir == "" {
+		return ""
+	}
+	path := filepath.Join(dir, fmt.Sprintf("slot-%d.img", slot))
+	if _, err := os.Stat(path); err != nil {
+		log.G(ctx).WithError(err).WithField("slot", slot).Warn("slot disk image not available; starting the VM without it")
+		return ""
+	}
+	return path
 }

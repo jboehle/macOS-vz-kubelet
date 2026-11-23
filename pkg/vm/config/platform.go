@@ -25,6 +25,9 @@ type PlatformConfiguration struct {
 	BlockStoragePath     string
 	AuxiliaryStoragePath string
 	IsOverlay            bool
+	// SlotDiskPath, when set, is a disk image attached read-write in place (no
+	// clone) as a second disk, so its contents outlive the VM.
+	SlotDiskPath string
 
 	*vz.MacPlatformConfiguration
 }

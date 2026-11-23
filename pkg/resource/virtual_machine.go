@@ -78,6 +78,12 @@ func (m *MacOSVirtualMachine) Env() []corev1.EnvVar {
 	return m.env
 }
 
+// AddEnv appends an environment variable for the virtual machine. The slice is
+// copied, so the pod spec's env is never modified.
+func (m *MacOSVirtualMachine) AddEnv(env corev1.EnvVar) {
+	m.env = append(append(make([]corev1.EnvVar, 0, len(m.env)+1), m.env...), env)
+}
+
 // Instance returns the internal VirtualMachineInstance.
 func (m *MacOSVirtualMachine) Instance() *vm.VirtualMachineInstance {
 	return m.instance

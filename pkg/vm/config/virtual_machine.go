@@ -128,7 +128,21 @@ func attachDeviceConfigurations(ctx context.Context, config *vz.VirtualMachineCo
 	if err != nil {
 		return fmt.Errorf("failed to create block device configuration: %w", err)
 	}
-	config.SetStorageDevicesVirtualMachineConfiguration([]vz.StorageDeviceConfiguration{blockDeviceConfig})
+	storageDevices := []vz.StorageDeviceConfiguration{blockDeviceConfig}
+
+	// Attach the slot's persistent disk, if any, as a second disk
+	if platformConfig.SlotDiskPath != "" {
+		slotDiskAttachment, err := vz.NewDiskImageStorageDeviceAttachment(platformConfig.SlotDiskPath, false)
+		if err != nil {
+			return fmt.Errorf("failed to create slot disk attachment for %s: %w", platformConfig.SlotDiskPath, err)
+		}
+		slotDiskConfig, err := vz.NewVirtioBlockDeviceConfiguration(slotDiskAttachment)
+		if err != nil {
+			return fmt.Errorf("failed to create slot disk device configuration: %w", err)
+		}
+		storageDevices = append(storageDevices, slotDiskConfig)
+	}
+	config.SetStorageDevicesVirtualMachineConfiguration(storageDevices)
 
 	// Create a network device configuration
 	networkDeviceConfig, err := createNetworkDeviceConfiguration(networkInterfaceIdentifier)

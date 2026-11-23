@@ -37,6 +37,10 @@ const (
 	// PodMountsDir is the directory where pod volumes are mounted.
 	// It is createdinside the cache directory.
 	PodMountsDir = "mounts"
+
+	// SlotDiskDirAnnotation names a host folder with one disk image per VM slot,
+	// slot-<n>.img. The macOS VM gets its slot's image as a second, persistent disk.
+	SlotDiskDirAnnotation = "macos-vz-kubelet/slot-disk-dir"
 )
 
 var (
@@ -207,6 +211,7 @@ func (c *VzClientAPIs) CreateVirtualizationGroup(ctx context.Context, pod *corev
 			PostStartAction:  postStartAction,
 			IgnoreImageCache: pullPolicy == corev1.PullAlways,
 			RegistryCreds:    vmCreds,
+			SlotDiskDir:      pod.Annotations[SlotDiskDirAnnotation],
 		})
 	})
 
